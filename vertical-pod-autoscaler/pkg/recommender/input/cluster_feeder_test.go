@@ -108,6 +108,24 @@ func (cs *fakeClusterState) AddSample(sample *model.ContainerUsageSampleWithKey)
 
 func (cs *fakeClusterState) AddOrUpdatePod(podID model.PodID, _ labels.Set, _ corev1.PodPhase) {
 	cs.addedPods = append(cs.addedPods, podID)
+	if cs.stubbedPods == nil {
+		cs.stubbedPods = make(map[model.PodID]*model.PodState)
+	}
+	if cs.stubbedPods[podID] == nil {
+		cs.stubbedPods[podID] = &model.PodState{
+			ID:         podID,
+			Containers: make(map[string]*model.ContainerState),
+		}
+	}
+}
+
+func (cs *fakeClusterState) SetInitContainers(podID model.PodID, initContainers []string) error {
+	pod, podExists := cs.stubbedPods[podID]
+	if !podExists || pod == nil {
+		return model.NewKeyError(podID)
+	}
+	pod.InitContainers = append([]string(nil), initContainers...)
+	return nil
 }
 
 func (cs *fakeClusterState) Pods() map[model.PodID]*model.PodState {

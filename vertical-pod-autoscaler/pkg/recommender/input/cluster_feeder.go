@@ -490,12 +490,12 @@ func (feeder *clusterStateFeeder) LoadPods() {
 				klog.V(0).InfoS("Failed to add container", "container", container.ID, "error", err)
 			}
 		}
-		if podState := feeder.clusterState.Pods()[pod.ID]; podState != nil {
-			initContainerNames := make([]string, 0, len(pod.InitContainers))
-			for _, initContainer := range pod.InitContainers {
-				initContainerNames = append(initContainerNames, initContainer.ID.ContainerName)
-			}
-			podState.InitContainers = initContainerNames
+		initContainerNames := make([]string, 0, len(pod.InitContainers))
+		for _, initContainer := range pod.InitContainers {
+			initContainerNames = append(initContainerNames, initContainer.ID.ContainerName)
+		}
+		if err = feeder.clusterState.SetInitContainers(pod.ID, initContainerNames); err != nil {
+			klog.V(0).InfoS("Failed to set init containers", "pod", klog.KRef(pod.ID.Namespace, pod.ID.PodName), "error", err)
 		}
 	}
 }
