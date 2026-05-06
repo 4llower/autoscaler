@@ -28,11 +28,11 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/eligibility"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/nodeevaltracker"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/pdb"
-	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/unneeded"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/unremovable"
 	"k8s.io/autoscaler/cluster-autoscaler/processors"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/nodes"
+	"k8s.io/autoscaler/cluster-autoscaler/resourcequotas"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/clustersnapshot"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/drainability/rules"
@@ -73,22 +73,21 @@ type Planner struct {
 	minUpdateInterval     time.Duration
 	eligibilityChecker    eligibilityChecker
 	nodeUtilizationMap    map[string]utilization.Info
-	resourceLimitsFinder  *resource.LimitsFinder
 	cc                    controllerReplicasCalculator
+	quotasTrackerFactory  *resourcequotas.TrackerFactory
 	scaleDownSetProcessor nodes.ScaleDownSetProcessor
 	scaleDownContext      *nodes.ScaleDownContext
 	maxNodeSkipEvalTime   *nodeevaltracker.MaxNodeSkipEvalTime
 }
 
 // New creates a new Planner object.
-func New(autoscalingCtx *ca_context.AutoscalingContext, processors *processors.AutoscalingProcessors, deleteOptions options.NodeDeleteOptions, drainabilityRules rules.Rules) *Planner {
-	resourceLimitsFinder := resource.NewLimitsFinder(processors.CustomResourcesProcessor)
+func New(autoscalingCtx *ca_context.AutoscalingContext, processors *processors.AutoscalingProcessors, deleteOptions options.NodeDeleteOptions, drainabilityRules rules.Rules, quotasTrackerFactory *resourcequotas.TrackerFactory) *Planner {
 	minUpdateInterval := autoscalingCtx.AutoscalingOptions.NodeGroupDefaults.ScaleDownUnneededTime
 	if minUpdateInterval == 0*time.Nanosecond {
 		minUpdateInterval = 1 * time.Nanosecond
 	}
 
-	unneededNodes := unneeded.NewNodes(processors.NodeGroupConfigProcessor, resourceLimitsFinder)
+	unneededNodes := unneeded.NewNodes(processors.NodeGroupConfigProcessor)
 	if autoscalingCtx.AutoscalingOptions.NodeDeletionCandidateTTL != 0 {
 		unneededNodes.LoadFromExistingTaints(autoscalingCtx, time.Now())
 	}
@@ -106,8 +105,8 @@ func New(autoscalingCtx *ca_context.AutoscalingContext, processors *processors.A
 		actuationInjector:     scheduling.NewHintingSimulator(),
 		eligibilityChecker:    eligibility.NewChecker(processors.NodeGroupConfigProcessor),
 		nodeUtilizationMap:    make(map[string]utilization.Info),
-		resourceLimitsFinder:  resourceLimitsFinder,
 		cc:                    newControllerReplicasCalculator(autoscalingCtx.ListerRegistry),
+		quotasTrackerFactory:  quotasTrackerFactory,
 		scaleDownSetProcessor: processors.ScaleDownSetProcessor,
 		scaleDownContext:      nodes.NewDefaultScaleDownContext(),
 		minUpdateInterval:     minUpdateInterval,
@@ -151,18 +150,26 @@ func (p *Planner) CleanUpUnneededNodes() {
 // to the Planner.
 func (p *Planner) NodesToDelete(_ time.Time) (empty, needDrain []*apiv1.Node) {
 	empty, needDrain = []*apiv1.Node{}, []*apiv1.Node{}
-	nodes, err := allNodes(p.autoscalingCtx.ClusterSnapshot)
-	if err != nil {
-		klog.Errorf("Nothing will scale down, failed to list nodes from ClusterSnapshot: %v", err)
-		return nil, nil
-	}
+
 	resourceLimiter, err := p.autoscalingCtx.CloudProvider.GetResourceLimiter()
 	if err != nil {
 		klog.Errorf("Nothing will scale down, failed to create resource limiter: %v", err)
 		return nil, nil
 	}
-	p.scaleDownContext.ResourcesLeft = p.resourceLimitsFinder.LimitsLeft(p.autoscalingCtx, nodes, resourceLimiter, p.latestUpdate).DeepCopy()
 	p.scaleDownContext.ResourcesWithLimits = resourceLimiter.GetResources()
+
+	nodes, err := allNodes(p.autoscalingCtx.ClusterSnapshot)
+	if err != nil {
+		klog.Errorf("Failed to list nodes for final limit check: %v", err)
+		return nil, nil
+	}
+
+	tracker, err := p.quotasTrackerFactory.NewMinQuotasTracker(p.autoscalingCtx, nodes)
+	if err != nil {
+		klog.Errorf("Failed to create tracker for final limit check: %v", err)
+		return nil, nil
+	}
+
 	emptyRemovableNodes, needDrainRemovableNodes, unremovableNodes := p.unneededNodes.RemovableAt(p.autoscalingCtx, *p.scaleDownContext, p.latestUpdate)
 	p.addUnremovableNodes(unremovableNodes)
 
@@ -178,6 +185,27 @@ func (p *Planner) NodesToDelete(_ time.Time) (empty, needDrain []*apiv1.Node) {
 			p.addUnremovableNodes([]simulator.UnremovableNode{{
 				Node:   nodeToRemove.Node,
 				Reason: simulator.BlockedByOnCompletionPod,
+			}})
+			continue
+		}
+
+		nodeGroup, err := p.autoscalingCtx.CloudProvider.NodeGroupForNode(nodeToRemove.Node)
+		if err != nil {
+			klog.Errorf("Failed to get node group for %s: %v", nodeToRemove.Node.Name, err)
+			continue
+		}
+
+		checkResult, err := tracker.ConsumeQuota(p.autoscalingCtx, nodeGroup, nodeToRemove.Node, 1)
+		if err != nil {
+			klog.Errorf("Failed to check limits for %s: %v", nodeToRemove.Node.Name, err)
+			continue
+		}
+
+		if checkResult.AllowedDelta != 1 {
+			klog.V(2).Infof("Skipping scale down of %s in this batch - would violate minimum limits", nodeToRemove.Node.Name)
+			p.addUnremovableNodes([]simulator.UnremovableNode{{
+				Node:   nodeToRemove.Node,
+				Reason: simulator.MinimalResourceLimitExceeded,
 			}})
 			continue
 		}
@@ -295,6 +323,8 @@ func (p *Planner) categorizeNodes(podDestinations map[string]bool, scaleDownCand
 	p.nodeUtilizationMap = utilizationMap
 	timer := time.NewTimer(p.autoscalingCtx.ScaleDownSimulationTimeout)
 	var skippedNodes []string
+	nodes, _ := allNodes(p.autoscalingCtx.ClusterSnapshot)
+	tracker, _ := p.quotasTrackerFactory.NewMinQuotasTracker(p.autoscalingCtx, nodes)
 
 	for i, node := range currentlyUnneededNodeNames {
 		if timedOut(timer) {
@@ -307,6 +337,26 @@ func (p *Planner) categorizeNodes(podDestinations map[string]bool, scaleDownCand
 			klog.V(4).Infof("%d out of %d nodes skipped in scale down simulation: there are already %d unneeded nodes so no point in looking for more. Total atomic scale down nodes: %d", len(currentlyUnneededNodeNames)-i, len(currentlyUnneededNodeNames), len(removableList), atomicScaleDownNodesCount)
 			break
 		}
+
+		nodeInfo, err := p.autoscalingCtx.ClusterSnapshot.GetNodeInfo(node)
+		if err != nil {
+			klog.Errorf("Failed to get node info for %s from snapshot: %v", node, err)
+			continue
+		}
+		nodeObj := nodeInfo.Node()
+
+		nodeGroup, err := p.autoscalingCtx.CloudProvider.NodeGroupForNode(nodeObj)
+		if err != nil {
+			klog.Errorf("Failed to get node group for %s: %v", node, err)
+			continue
+		}
+
+		checkResult, _ := tracker.CheckQuota(p.autoscalingCtx, nodeGroup, nodeObj, 1)
+		if checkResult.AllowedDelta == 0 {
+			p.unremovableNodes.AddTimeout(&simulator.UnremovableNode{Node: nodeObj, Reason: simulator.MinimalResourceLimitExceeded}, unremovableTimeout)
+			continue
+		}
+
 		removable, unremovable := p.rs.SimulateNodeRemoval(node, podDestinations, p.latestUpdate, p.autoscalingCtx.RemainingPdbTracker)
 		if removable != nil {
 			_, inParallel, _ := p.autoscalingCtx.RemainingPdbTracker.CanRemovePods(removable.PodsToReschedule)
@@ -316,6 +366,7 @@ func (p *Planner) categorizeNodes(podDestinations map[string]bool, scaleDownCand
 			delete(podDestinations, removable.Node.Name)
 			p.autoscalingCtx.RemainingPdbTracker.RemovePods(removable.PodsToReschedule)
 			removableList = append(removableList, *removable)
+			tracker.ConsumeQuota(p.autoscalingCtx, nodeGroup, removable.Node, 1)
 			if p.atomicScaleDownNode(removable) {
 				atomicScaleDownNodesCount++
 				klog.V(2).Infof("Considering node %s for atomic scale down. Total atomic scale down nodes count: %d", removable.Node.Name, atomicScaleDownNodesCount)

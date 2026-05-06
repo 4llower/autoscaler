@@ -18,13 +18,11 @@ package nodes
 
 import (
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown"
-	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/resource"
 )
 
 // ScaleDownContext keeps an updated version actuationStatus and resourcesLeft for the scaling down process
 type ScaleDownContext struct {
 	ActuationStatus     scaledown.ActuationStatus
-	ResourcesLeft       resource.Limits
 	ResourcesWithLimits []string
 }
 

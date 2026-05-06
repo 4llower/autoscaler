@@ -25,8 +25,7 @@ import (
 	ca_context "k8s.io/autoscaler/cluster-autoscaler/context"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/eligibility"
-	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/resource"
-	"k8s.io/autoscaler/cluster-autoscaler/metrics"
+
 	"k8s.io/autoscaler/cluster-autoscaler/processors/nodes"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator"
 	"k8s.io/autoscaler/cluster-autoscaler/utils"
@@ -38,10 +37,10 @@ import (
 
 // Nodes tracks the state of cluster nodes that are not needed.
 type Nodes struct {
-	sdtg         scaleDownTimeGetter
-	limitsFinder *resource.LimitsFinder
-	cachedList   []*scaledown.UnneededNode
-	byName       map[string]*node
+	sdtg scaleDownTimeGetter
+
+	cachedList []*scaledown.UnneededNode
+	byName     map[string]*node
 }
 
 type node struct {
@@ -59,10 +58,9 @@ type scaleDownTimeGetter interface {
 }
 
 // NewNodes returns a new initialized Nodes object.
-func NewNodes(sdtg scaleDownTimeGetter, limitsFinder *resource.LimitsFinder) *Nodes {
+func NewNodes(sdtg scaleDownTimeGetter) *Nodes {
 	return &Nodes{
-		sdtg:         sdtg,
-		limitsFinder: limitsFinder,
+		sdtg: sdtg,
 	}
 }
 
@@ -288,28 +286,6 @@ func (n *Nodes) unremovableReason(autoscalingCtx *ca_context.AutoscalingContext,
 
 	if reason := verifyMinSize(node.Name, nodeGroup, nodeGroupSize, scaleDownContext.ActuationStatus); reason != simulator.NoReason {
 		return reason
-	}
-
-	resourceDelta, err := n.limitsFinder.DeltaForNode(autoscalingCtx, node, nodeGroup, scaleDownContext.ResourcesWithLimits)
-	if err != nil {
-		klog.Errorf("Error getting node resources: %v", err)
-		return simulator.UnexpectedError
-	}
-
-	checkResult := scaleDownContext.ResourcesLeft.TryDecrementBy(resourceDelta)
-	if checkResult.Exceeded() {
-		klog.V(4).Infof("Skipping %s - minimal limit exceeded for %v", node.Name, checkResult.ExceededResources)
-		for _, resource := range checkResult.ExceededResources {
-			switch resource {
-			case cloudprovider.ResourceNameCores:
-				metrics.RegisterSkippedScaleDownCPU()
-			case cloudprovider.ResourceNameMemory:
-				metrics.RegisterSkippedScaleDownMemory()
-			default:
-				continue
-			}
-		}
-		return simulator.MinimalResourceLimitExceeded
 	}
 
 	nodeGroupSize[nodeGroup.Id()]--

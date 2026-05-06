@@ -28,7 +28,6 @@ import (
 	testprovider "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/test"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	ca_context "k8s.io/autoscaler/cluster-autoscaler/context"
-	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/status"
 	. "k8s.io/autoscaler/cluster-autoscaler/core/test"
 	nodeprocessors "k8s.io/autoscaler/cluster-autoscaler/processors/nodes"
@@ -150,7 +149,7 @@ func TestUpdate(t *testing.T) {
 				unreadyTime:  defaultUnreadyTime,
 			}
 
-			nodes := NewNodes(fakeTimeGetter, nil)
+			nodes := NewNodes(fakeTimeGetter)
 			ctx := &ca_context.AutoscalingContext{CloudProvider: provider}
 
 			nodes.Update(ctx, tc.initialNodes, initialTimestamp)
@@ -266,13 +265,12 @@ func TestRemovableAt(t *testing.T) {
 				unneededTime: 0,
 				unreadyTime:  expectedThreshold,
 			}
-			n := NewNodes(fakeTimeGetter, &resource.LimitsFinder{})
+			n := NewNodes(fakeTimeGetter)
 
 			n.Update(&autoscalingCtx, removableNodes, time.Now().Add(-10*time.Minute)) //add -10 min to work correctly with unneeded time threshold
 
 			gotEmptyToRemove, gotDrainToRemove, _ := n.RemovableAt(&autoscalingCtx, nodeprocessors.ScaleDownContext{
 				ActuationStatus:     as,
-				ResourcesLeft:       resource.Limits{},
 				ResourcesWithLimits: []string{},
 			}, time.Now())
 			if len(gotDrainToRemove) != tc.numDrainToRemove || len(gotEmptyToRemove) != tc.numEmptyToRemove {
@@ -439,13 +437,12 @@ func TestRemovableAt_UnremovableReasons(t *testing.T) {
 					unreadyTime:  tc.thresholds.unready,
 				}
 			}
-			n := NewNodes(timeGetter, &resource.LimitsFinder{})
+			n := NewNodes(timeGetter)
 
 			n.Update(&autoscalingCtx, nodesToProcess, now.Add(tc.nodeConfig.sinceOffset))
 
 			sdCtx := nodeprocessors.ScaleDownContext{
 				ActuationStatus:     &fakeActuationStatus{deletionCount: map[string]int{}},
-				ResourcesLeft:       nil,
 				ResourcesWithLimits: []string{},
 			}
 
@@ -533,7 +530,7 @@ func TestNodeLoadFromExistingTaints(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			nodes := NewNodes(nil, nil)
+			nodes := NewNodes(nil)
 
 			allNodeLister := kube_util.NewTestNodeLister(nil)
 			allNodeLister.SetNodes(tc.allNodes)
